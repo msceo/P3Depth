@@ -8,12 +8,7 @@ from omegaconf import DictConfig
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image
-import numpy as np
-import torch
-import random
-import scipy.ndimage as ndimage
-# from .transforms import *
+from .transforms import *
 
 def _is_pil_image(img):
     return isinstance(img, Image.Image)
@@ -28,14 +23,15 @@ def preprocessing_transforms(mode):
 
 class DataLoadPreprocess(Dataset):
     def __init__(self, csv_file, config, mode, transform=None, eval=False):
-        self.paths = pd.read_csv(csv_file, header=None,
-                                     names=['image', 'depth'])
+        self.paths = pd.read_csv(csv_file, header=None, names=['image', 'depth'])
         self.config = config
         self.mode = mode
         self.transform = transform
         self.to_tensor = ToTensor
 
-        self.dataset_path = os.path.dirname(os.path.dirname(csv_file))
+        self.do_kb_crop = True
+
+        self.dataset_path = os.path.dirname(csv_file)
 
         self.input_height = self.config.DATA.TRAIN_CROP_SIZE[1]
         self.input_width = self.config.DATA.TRAIN_CROP_SIZE[0]
@@ -45,19 +41,31 @@ class DataLoadPreprocess(Dataset):
 
     def __getitem__(self, idx):
 
-        image_path = self.dataset_path + "/"+ self.paths['image'][idx]
-        depth_path = self.dataset_path + "/"+ self.paths['depth'][idx]
+        #image_path = self.dataset_path +'/'+ self.paths['image'][idx]
+        #depth_path = self.dataset_path + '/' + self.paths['depth'][idx]
+
+        image_path = self.paths['image'][idx]
+        depth_path = self.paths['depth'][idx]
 
         image = Image.open(image_path)
-        depth_gt = Image.open(depth_path)
-
-        depth_gt = depth_gt.crop((41, 45, 601, 471))
-        image = image.crop((41, 45, 601, 471))
+        # NOTE: modified for ILSR
+        # depth_gt = Image.open(depth_path).convert('L')
+        depth_gt = np.load(depth_path)[..., None]
+        depth_completed = None
 
         if self.mode == 'train':
-            depth_completed_path = depth_path #self.dataset_path + '/' + self.paths['depth'][idx].replace("train","train_completed")
-            depth_completed = Image.open(depth_completed_path)
-            depth_completed = depth_completed.crop((41, 45, 601, 471))
+            depth_completed_path = depth_path
+            depth_completed = np.load(depth_completed_path)[..., None]
+
+        if self.do_kb_crop is True:
+            height = image.height
+            width = image.width
+            top_margin = int(height - 352)
+            left_margin = int((width - 1216) / 2)
+            image = image.crop((left_margin, top_margin, left_margin + 1216, top_margin + 352))
+            depth_gt = depth_gt.crop((left_margin, top_margin, left_margin + 1216, top_margin + 352))
+            if self.mode == 'train':
+                depth_completed = depth_completed.crop((left_margin, top_margin, left_margin + 1216, top_margin + 352))
 
         if self.mode == 'train' and self.do_random_rotate is True:
             random_angle = (random.random() - 0.5) * 2 * self.degree
@@ -66,28 +74,19 @@ class DataLoadPreprocess(Dataset):
             depth_completed = self.rotate_image(depth_completed, random_angle, flag=Image.NEAREST)
 
         image = np.asarray(image, dtype=np.float32) / 255.0
+
         depth_gt = np.asarray(depth_gt, dtype=np.float32)
+        # depth_gt = np.expand_dims(depth_gt, axis=2)
+        depth_gt = depth_gt / 20.0
 
         if self.mode == 'train':
-            depth_gt = depth_gt * 1000.0
-            depth_gt = depth_gt / 255.0
-        else:
-            depth_gt = depth_gt / 1000.0
 
-        if self.mode == 'train':
             depth_completed = np.asarray(depth_completed, dtype=np.float32)
-            depth_completed = np.expand_dims(depth_completed, axis=2)
-            depth_completed = depth_completed * 1000.0
-            depth_completed = depth_completed / 255.0
+            # depth_completed = np.expand_dims(depth_completed, axis=2)
+            depth_completed = depth_completed / 20.0
 
             image, depth_gt, depth_completed = self.random_crop(image, depth_gt, depth_completed, self.input_height, self.input_width)
-            image, depth_gt, depth_completed = self.train_preprocess(image, depth_completed, depth_gt)
-
-            depth_gt = np.clip(depth_gt, 10.0, 1000.0)
-            depth_gt = 1000. / depth_gt
-
-            depth_completed = np.clip(depth_completed, 10.0, 1000.0)
-            depth_completed = 1000. / depth_completed
+            image, depth_gt, depth_completed = self.train_preprocess(image, depth_gt, depth_completed)
 
             sample = {'image': image, 'depth': depth_gt, 'depth_completed': depth_completed}
         else:
@@ -97,10 +96,8 @@ class DataLoadPreprocess(Dataset):
             sample = self.transform(sample)
 
         if self.mode != 'train':
-            #print(os.path.basename(self.paths['image'][idx]))
-            sample['path'] = os.path.basename(self.paths['image'][idx]) #) #.replace("_colors", "")
-
-        # sample['path'] = os.path.basename(self.paths['image'][idx])  # ) #.replace("_colors", "")
+            #sample['path'] = self.paths['image'][idx]
+            sample['path'] = self.paths['depth'][idx]
 
         # print("min image: " + str(torch.min(sample['image']).item()) + " max image: " + str(torch.max(sample['image']).item()))
         # print("min depth: " + str(torch.min(sample['depth']).item()) + " max depth: " + str(torch.max(sample['depth']).item()))
@@ -146,7 +143,7 @@ class DataLoadPreprocess(Dataset):
         image_aug = image ** gamma
 
         # brightness augmentation
-        brightness = random.uniform(0.75, 1.25)
+        brightness = random.uniform(0.9, 1.1)
 
         image_aug = image_aug * brightness
 
@@ -220,8 +217,10 @@ class ILSRDataModule(LightningDataModule):
     def __init__(self, config: DictConfig):
         super().__init__()
         self.config = config
-        self.train_csv_path = os.path.join(config.DATASET.PATH, config.DATASET.TYPE, 'data' , 'nyu2_train.csv')
-        self.test_csv_path = os.path.join(config.DATASET.PATH, config.DATASET.TYPE, 'data' , 'nyu2_test.csv')
+        #self.train_csv_path = os.path.join(config.DATASET.PATH, config.DATASET.TYPE, 'train.csv')
+        #self.test_csv_path = os.path.join(config.DATASET.PATH, config.DATASET.TYPE, 'test.csv')
+        self.train_csv_path = os.path.join(config.DATASET.PATH , 'train.csv')
+        self.test_csv_path = os.path.join(config.DATASET.PATH , 'test.csv')
 
         mode = "train"
         self.training_samples = DataLoadPreprocess(self.train_csv_path, self.config, mode, transform=preprocessing_transforms(mode))
@@ -229,7 +228,7 @@ class ILSRDataModule(LightningDataModule):
         self.train_loader = DataLoader(self.training_samples, self.config.SOLVER.BATCHSIZE,
                                shuffle=True,
                                num_workers=self.config.SOLVER.NUM_WORKERS,
-                               pin_memory=True,
+                               pin_memory=False,
                                sampler=None)
 
         mode = "test"
@@ -244,7 +243,7 @@ class ILSRDataModule(LightningDataModule):
         self.test_loader = DataLoader(self.testing_samples, 1,
                                shuffle = shuffle,
                                num_workers=1,
-                               pin_memory=True,
+                               pin_memory=False,
                                sampler=None)
 
         return self.test_loader
@@ -254,7 +253,7 @@ class ILSRDataModuleTest(LightningDataModule):
         super().__init__()
         self.config = config
 
-        self.test_csv_path = os.path.join(config.DATASET.PATH, config.DATASET.TYPE, 'test.csv')
+        self.test_csv_path = config.TEST_CSV_PATH
 
         mode = "test"
         self.testing_samples = DataLoadPreprocess(self.test_csv_path, self.config, mode, transform=preprocessing_transforms(mode))
@@ -265,7 +264,7 @@ class ILSRDataModuleTest(LightningDataModule):
         self.test_loader = DataLoader(self.testing_samples, 1,
                                shuffle = shuffle,
                                num_workers=1,
-                               pin_memory=True,
+                               pin_memory=False,
                                sampler=None)
 
         return self.test_loader
